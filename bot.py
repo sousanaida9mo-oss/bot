@@ -2176,6 +2176,10 @@ async def verify_emails_btn(c: types.CallbackQuery):
     if not xls:
         await c.answer("Сначала загрузите XLSX через «Проверка ников».", show_alert=True); return
 
+    # Quick check of verify proxies before starting
+    proxy_report = await _quick_check_verify_proxies(c.from_user.id)
+    await bot.send_message(chat_id, f"Проверка Verify прокси: {proxy_report}")
+
     status_msg = await bot.send_message(chat_id, "Проверка email выполняется…")
     try:
         df = await asyncio.to_thread(pd.read_excel, BytesIO(xls))
@@ -2216,6 +2220,24 @@ async def _quick_check_send_proxies(uid: int) -> str:
             s.set_proxy(socks.SOCKS5, p["host"], int(p["port"]), True, p.get("user"), p.get("password"))
             s.settimeout(5)
             s.connect(("smtp.gmail.com", 587))
+            s.close()
+        except Exception:
+            bad.append(f"{p['host']}:{p['port']} (ID={p.get('id','?')})")
+    if bad:
+        return "Неработающие прокси:\n" + "\n".join(bad)
+    return "✅ Все прокси валидны"
+
+async def _quick_check_verify_proxies(uid: int) -> str:
+    await asyncio.to_thread(prepare_smtp25_from_db, uid)
+    if not smtp25.VERIFY_PROXY_LIST:
+        return "Нет verify‑прокси."
+    bad: List[str] = []
+    for p in smtp25.VERIFY_PROXY_LIST:
+        try:
+            s = socks.socksocket()
+            s.set_proxy(socks.SOCKS5, p["host"], int(p["port"]), True, p.get("user"), p.get("password"))
+            s.settimeout(5)
+            s.connect(("imap.gmail.com", 993))  # IMAP SSL for verify proxies
             s.close()
         except Exception:
             bad.append(f"{p['host']}:{p['port']} (ID={p.get('id','?')})")
