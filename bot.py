@@ -762,7 +762,7 @@ async def interval_reset(c: types.CallbackQuery):
 # ====== PROXIES ======
 def proxies_root_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🛡 Verif прокси", callback_data="proxies:open:verify")],
+        [InlineKeyboardButton(text="🌐 Verify прокси", callback_data="proxies:open:verify")],
         [InlineKeyboardButton(text="🚀 Send прокси", callback_data="proxies:open:send")],
         *nav_row("settings:back")
     ])
@@ -803,7 +803,7 @@ def proxies_section_kb(kind: str) -> InlineKeyboardMarkup:
 def render_proxies_text_page(user_id: int, kind: str, page: int, per_page: int = 10) -> Tuple[str, InlineKeyboardMarkup]:
     with SessionLocal() as s:
         items = s.query(Proxy).filter_by(user_id=user_id, type=kind).order_by(Proxy.id.asc()).all()
-    title = "Verif прокси" if kind == "verify" else "Send прокси"
+    title = "Verify прокси" if kind == "verify" else "Send прокси"
     total = len(items)
     if not total:
         return f"{title}:\n(список пуст)", proxies_section_kb(kind)
@@ -833,7 +833,7 @@ async def proxies_root(c: types.CallbackQuery):
 async def proxies_open_section(c: types.CallbackQuery):
     if not await ensure_approved(c): return
     kind = c.data.split(":")[2]
-    title = "Verif прокси" if kind == "verify" else "Send прокси"
+    title = "Verify прокси" if kind == "verify" else "Send прокси"
     await safe_edit_message(c.message, f"Настройки {title}:", reply_markup=proxies_section_kb(kind)); await safe_cq_answer(c)
 
 @dp.callback_query(F.data.startswith("proxies:list:"))
@@ -873,7 +873,7 @@ async def proxies_add_save(m: types.Message, state: FSMContext):
         return
 
     target_host, target_port = _probe_target_for_kind(kind)
-    lines: List[str] = [f"Проверка {('Verif' if kind=='verify' else 'Send')} прокси:"]
+    lines: List[str] = [f"Проверка {('Verify' if kind=='verify' else 'Send')} прокси:"]
     ok_cnt = 0
     fail_cnt = 0
 
@@ -2188,7 +2188,7 @@ async def verify_emails_btn(c: types.CallbackQuery):
                 "Не найдено ни одного валидного email.\n"
                 "Проверьте:\n"
                 "• колонку с никами (seller_nick/«Имя продавца»)\n"
-                "• корректность Verif‑прокси в Настройках\n"
+                "• корректность Verify‑прокси в Настройках\n"
                 "• список доменов"
             )
             await bot.send_message(chat_id, hint)
