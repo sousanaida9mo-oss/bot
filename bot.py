@@ -762,7 +762,7 @@ async def interval_reset(c: types.CallbackQuery):
 # ====== PROXIES ======
 def proxies_root_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🛡 Verif прокси", callback_data="proxies:open:verify")],
+        [InlineKeyboardButton(text="🌐 Verify прокси", callback_data="proxies:open:verify")],
         [InlineKeyboardButton(text="🚀 Send прокси", callback_data="proxies:open:send")],
         *nav_row("settings:back")
     ])
@@ -803,7 +803,7 @@ def proxies_section_kb(kind: str) -> InlineKeyboardMarkup:
 def render_proxies_text_page(user_id: int, kind: str, page: int, per_page: int = 10) -> Tuple[str, InlineKeyboardMarkup]:
     with SessionLocal() as s:
         items = s.query(Proxy).filter_by(user_id=user_id, type=kind).order_by(Proxy.id.asc()).all()
-    title = "Verif прокси" if kind == "verify" else "Send прокси"
+    title = "Verify прокси" if kind == "verify" else "Send прокси"
     total = len(items)
     if not total:
         return f"{title}:\n(список пуст)", proxies_section_kb(kind)
@@ -833,7 +833,7 @@ async def proxies_root(c: types.CallbackQuery):
 async def proxies_open_section(c: types.CallbackQuery):
     if not await ensure_approved(c): return
     kind = c.data.split(":")[2]
-    title = "Verif прокси" if kind == "verify" else "Send прокси"
+    title = "Verify прокси" if kind == "verify" else "Send прокси"
     await safe_edit_message(c.message, f"Настройки {title}:", reply_markup=proxies_section_kb(kind)); await safe_cq_answer(c)
 
 @dp.callback_query(F.data.startswith("proxies:list:"))
@@ -873,7 +873,7 @@ async def proxies_add_save(m: types.Message, state: FSMContext):
         return
 
     target_host, target_port = _probe_target_for_kind(kind)
-    lines: List[str] = [f"Проверка {('Verif' if kind=='verify' else 'Send')} прокси:"]
+    lines: List[str] = [f"Проверка {('Verify' if kind=='verify' else 'Send')} прокси:"]
     ok_cnt = 0
     fail_cnt = 0
 
@@ -2176,6 +2176,10 @@ async def verify_emails_btn(c: types.CallbackQuery):
     if not xls:
         await c.answer("Сначала загрузите XLSX через «Проверка ников».", show_alert=True); return
 
+    # Quick check of verify proxies before starting
+    proxy_report = await _quick_check_verify_proxies(c.from_user.id)
+    await bot.send_message(chat_id, f"Проверка Verify прокси: {proxy_report}")
+
     status_msg = await bot.send_message(chat_id, "Проверка email выполняется…")
     try:
         df = await asyncio.to_thread(pd.read_excel, BytesIO(xls))
@@ -2188,7 +2192,7 @@ async def verify_emails_btn(c: types.CallbackQuery):
                 "Не найдено ни одного валидного email.\n"
                 "Проверьте:\n"
                 "• колонку с никами (seller_nick/«Имя продавца»)\n"
-                "• корректность Verif‑прокси в Настройках\n"
+                "• корректность Verify‑прокси в Настройках\n"
                 "• список доменов"
             )
             await bot.send_message(chat_id, hint)
@@ -2216,6 +2220,24 @@ async def _quick_check_send_proxies(uid: int) -> str:
             s.set_proxy(socks.SOCKS5, p["host"], int(p["port"]), True, p.get("user"), p.get("password"))
             s.settimeout(5)
             s.connect(("smtp.gmail.com", 587))
+            s.close()
+        except Exception:
+            bad.append(f"{p['host']}:{p['port']} (ID={p.get('id','?')})")
+    if bad:
+        return "Неработающие прокси:\n" + "\n".join(bad)
+    return "✅ Все прокси валидны"
+
+async def _quick_check_verify_proxies(uid: int) -> str:
+    await asyncio.to_thread(prepare_smtp25_from_db, uid)
+    if not smtp25.VERIFY_PROXY_LIST:
+        return "Нет verify‑прокси."
+    bad: List[str] = []
+    for p in smtp25.VERIFY_PROXY_LIST:
+        try:
+            s = socks.socksocket()
+            s.set_proxy(socks.SOCKS5, p["host"], int(p["port"]), True, p.get("user"), p.get("password"))
+            s.settimeout(5)
+            s.connect(("imap.gmail.com", 993))  # IMAP SSL for verify proxies
             s.close()
         except Exception:
             bad.append(f"{p['host']}:{p['port']} (ID={p.get('id','?')})")
