@@ -34,6 +34,7 @@ from email import message_from_bytes
 from email.utils import parseaddr
 from aiogram.utils.markdown import code
 from html_templates import router as html_templates_router, html_menu_kb, get_last_html
+from reply_send_html import router as reply_send_html_router
 
 
 from db import (
@@ -42,6 +43,7 @@ from db import (
     list_domains, set_domains_order, add_domain, delete_domains_by_indices, clear_domains,
     add_account, update_account, delete_account, clear_accounts,
     get_setting, set_setting,
+    get_setting_async, set_setting_async, get_incoming_message_by_tgmid_async,
 )
 
 import config
@@ -207,7 +209,20 @@ class AdminFSM(StatesGroup):
     add_id = State()
     deny_id = State()
 
+# +++ API Token FSM +++
+class APITokenFSM(StatesGroup):
+    waiting_token = State()
+
+# +++ Custom HTML FSM +++
+class CustomHTMLFSM(StatesGroup):
+    waiting_text = State()
+
 # ====== Runtime ======
+# Global runtime map for created links: (user_id, incoming_tg_message_id) -> Dict[str, Any]
+CREATED_LINKS: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+# Runtime storage for incoming messages as fallback: (user_id, tg_message_id) -> dict
+INCOMING_RT: Dict[Tuple[int, int], Dict[str, Any]] = {}
 tg_session = AiohttpSession(timeout=30)
 bot = Bot(
     token=config.TELEGRAM_TOKEN,
@@ -216,6 +231,7 @@ bot = Bot(
 )
 dp = Dispatcher(storage=MemoryStorage())
 dp.include_router(html_templates_router)    # меню генерации HTML‑шаблонов
+dp.include_router(reply_send_html_router)   # отправка HTML в ответ на входящие
 
 
 LAST_XLSX_PER_CHAT: Dict[int, bytes] = {}
@@ -557,6 +573,375 @@ async def settings_back(c: types.CallbackQuery):
     if not await ensure_approved(c): return
     await c.message.edit_text("Настройки:", reply_markup=settings_kb()); await safe_cq_answer(c)
 
+@dp.callback_query(F.data == "settings:api_token")
+async def api_token_open(c: types.CallbackQuery, state: FSMContext):
+    if not await ensure_approved(c): return
+    
+    # Get current token if exists
+    current_token = await get_setting_async(c.from_user.id, "api_token", "")
+    token_display = f"Текущий: {current_token[:10]}***" if current_token else "Не установлен"
+    
+    text = f"API Token:\n{token_display}\n\nВведите новый API token:"
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:back")]
+    ])
+    
+    await c.message.edit_text(text, reply_markup=cancel_kb)
+    await state.set_state(APITokenFSM.waiting_token)
+    await safe_cq_answer(c)
+
+@dp.message(APITokenFSM.waiting_token)
+async def api_token_save(m: types.Message, state: FSMContext):
+    if not await ensure_approved(m): return
+    
+    token = (m.text or "").strip()
+    if not token:
+        await m.answer("Token не может быть пустым. Попробуйте снова:")
+        return
+    
+    await set_setting_async(m.from_user.id, "api_token", token)
+    await state.clear()
+    
+    await m.answer("API Token сохранён!", reply_markup=settings_kb())
+
+def get_api_base_url(user_id: int) -> str:
+    """Get API base URL from settings with default fallback"""
+    return get_setting(user_id, "api_base") or "https://ваш_домен"
+
+def get_incoming_message_keyboard(user_id: int, tg_message_id: int) -> InlineKeyboardMarkup:
+    """Generate keyboard for incoming message based on whether link exists"""
+    buttons = [
+        [InlineKeyboardButton(text="✉️ Ответить", callback_data="reply:msg")]
+    ]
+    
+    # Check if link was created for this message
+    link_exists = (user_id, tg_message_id) in CREATED_LINKS
+    
+    if link_exists:
+        # Add Send HTML button if link exists
+        buttons.append([InlineKeyboardButton(text="📩 Отправить HTML", callback_data="send:html")])
+    else:
+        # Add Create Link button if no link exists yet
+        buttons.append([InlineKeyboardButton(text="🔗 Создать ссылку", callback_data="link:create")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+@dp.callback_query(F.data == "link:create")
+async def link_create_handler(c: types.CallbackQuery):
+    if not await ensure_approved(c): return
+    
+    user_id = c.from_user.id
+    src_tg_mid = c.message.message_id
+    
+    # Get API token
+    api_token = await get_setting_async(user_id, "api_token", "")
+    if not api_token:
+        await c.answer("Сначала настройте API Token в настройках!", show_alert=True)
+        return
+    
+    # Retrieve incoming message data
+    incoming_row = await get_incoming_message_by_tgmid_async(user_id, src_tg_mid)
+    incoming_data = None
+    
+    if incoming_row:
+        incoming_data = {
+            "from_name": incoming_row.from_name,
+            "from_email": incoming_row.from_email,
+            "subject": incoming_row.subject,
+            "body": incoming_row.body,
+        }
+    else:
+        # Fallback to runtime storage
+        rt_data = INCOMING_RT.get((user_id, src_tg_mid))
+        if rt_data:
+            incoming_data = {
+                "from_name": rt_data["from_name"],
+                "from_email": rt_data["from_email"],
+                "subject": rt_data["subject"],
+                "body": rt_data["body"],
+            }
+    
+    if not incoming_data:
+        await c.answer("Не удалось найти данные входящего сообщения", show_alert=True)
+        return
+    
+    # Build API request data
+    api_base = get_api_base_url(user_id)
+    api_url = f"{api_base}/custom-api/create-link"
+    
+    link_data = {
+        "token": api_token,
+        "from_name": incoming_data["from_name"],
+        "from_email": incoming_data["from_email"],
+        "subject": incoming_data["subject"],
+        "body": incoming_data["body"]
+    }
+    
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.post(api_url, json=link_data, timeout=10) as resp:
+                if resp.status == 200:
+                    response_data = await resp.json()
+                    
+                    # Store created link data
+                    CREATED_LINKS[(user_id, src_tg_mid)] = {
+                        "link_url": response_data.get("link_url", ""),
+                        "title": response_data.get("title", ""),
+                        "price": response_data.get("price", ""),
+                        "image_url": response_data.get("image_url", ""),
+                        "service": response_data.get("service", ""),
+                        "payload": response_data
+                    }
+                    
+                    # Send rich reply with photo, title, price, link
+                    reply_text = (
+                        f"✅ Ссылка создана!\n\n"
+                        f"🏷 {response_data.get('title', 'N/A')}\n"
+                        f"💰 {response_data.get('price', 'N/A')}\n"
+                        f"🔗 {response_data.get('link_url', 'N/A')}"
+                    )
+                    
+                    # Try to send with photo if image_url exists
+                    image_url = response_data.get("image_url")
+                    if image_url:
+                        try:
+                            await bot.send_photo(
+                                c.message.chat.id,
+                                photo=image_url,
+                                caption=reply_text,
+                                reply_to_message_id=src_tg_mid
+                            )
+                        except Exception:
+                            # Fallback to text if photo fails
+                            await bot.send_message(
+                                c.message.chat.id,
+                                reply_text,
+                                reply_to_message_id=src_tg_mid
+                            )
+                    else:
+                        await bot.send_message(
+                            c.message.chat.id,
+                            reply_text,
+                            reply_to_message_id=src_tg_mid
+                        )
+                    
+                    await c.answer("Ссылка успешно создана!")
+                    
+                    # Update the original message keyboard to show "Send HTML" option
+                    try:
+                        updated_kb = get_incoming_message_keyboard(user_id, src_tg_mid)
+                        await bot.edit_message_reply_markup(
+                            chat_id=c.message.chat.id,
+                            message_id=src_tg_mid,
+                            reply_markup=updated_kb
+                        )
+                    except Exception:
+                        pass
+                else:
+                    await c.answer(f"Ошибка API: {resp.status}", show_alert=True)
+                    
+    except Exception as e:
+        await c.answer(f"Ошибка при создании ссылки: {str(e)}", show_alert=True)
+
+@dp.callback_query(F.data == "send:html")
+async def send_html_handler(c: types.CallbackQuery, state: FSMContext):
+    if not await ensure_approved(c): return
+    
+    user_id = c.from_user.id
+    src_tg_mid = c.message.message_id
+    
+    # Check if link was created for this message
+    link_data = CREATED_LINKS.get((user_id, src_tg_mid))
+    if not link_data:
+        await c.answer("Сначала создайте ссылку для этого сообщения!", show_alert=True)
+        return
+    
+    # Get recipient email from incoming message
+    incoming_row = await get_incoming_message_by_tgmid_async(user_id, src_tg_mid)
+    to_email = None
+    
+    if incoming_row:
+        to_email = incoming_row.from_email
+    else:
+        # Fallback to runtime storage
+        rt_data = INCOMING_RT.get((user_id, src_tg_mid))
+        if rt_data:
+            to_email = rt_data["from_email"]
+    
+    if not to_email:
+        await c.answer("Не удалось определить email получателя", show_alert=True)
+        return
+    
+    # Show template selection
+    template_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="GO", callback_data=f"htmlgen:GO:{src_tg_mid}")],
+        [InlineKeyboardButton(text="QR", callback_data=f"htmlgen:QR:{src_tg_mid}")],
+        [InlineKeyboardButton(text="PUSH", callback_data=f"htmlgen:PUSH:{src_tg_mid}")],
+        [InlineKeyboardButton(text="SMS", callback_data=f"htmlgen:SMS:{src_tg_mid}")],
+        [InlineKeyboardButton(text="BACK", callback_data=f"htmlgen:BACK:{src_tg_mid}")],
+        [InlineKeyboardButton(text="CUSTOM", callback_data=f"htmlgen:CUSTOM:{src_tg_mid}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="htmlgen:cancel")]
+    ])
+    
+    await c.message.answer(
+        f"Выберите HTML шаблон для отправки на {to_email}:",
+        reply_markup=template_kb
+    )
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("htmlgen:"))
+async def html_template_selected(c: types.CallbackQuery, state: FSMContext):
+    if not await ensure_approved(c): return
+    
+    parts = c.data.split(":")
+    if len(parts) < 2:
+        await c.answer("Ошибка в данных шаблона", show_alert=True)
+        return
+    
+    action = parts[1]
+    
+    if action == "cancel":
+        await c.message.edit_text("Отменено.")
+        await c.answer()
+        return
+    
+    if len(parts) < 3:
+        await c.answer("Ошибка в данных шаблона", show_alert=True)
+        return
+    
+    template_type = action
+    src_tg_mid = int(parts[2])
+    user_id = c.from_user.id
+    
+    # Get link data
+    link_data = CREATED_LINKS.get((user_id, src_tg_mid))
+    if not link_data:
+        await c.answer("Данные ссылки не найдены", show_alert=True)
+        return
+    
+    link_url = link_data.get("link_url", "")
+    if not link_url:
+        await c.answer("URL ссылки не найден", show_alert=True)
+        return
+    
+    # Get recipient email
+    incoming_row = await get_incoming_message_by_tgmid_async(user_id, src_tg_mid)
+    to_email = None
+    
+    if incoming_row:
+        to_email = incoming_row.from_email
+    else:
+        rt_data = INCOMING_RT.get((user_id, src_tg_mid))
+        if rt_data:
+            to_email = rt_data["from_email"]
+    
+    if not to_email:
+        await c.answer("Не удалось определить email получателя", show_alert=True)
+        return
+    
+    if template_type == "CUSTOM":
+        # For custom template, ask for custom text
+        await c.message.edit_text("Введите текст для кастомного шаблона:")
+        await state.set_state(CustomHTMLFSM.waiting_text)
+        await state.update_data(
+            link_url=link_url,
+            to_email=to_email,
+            src_tg_mid=src_tg_mid,
+            link_data=link_data
+        )
+        await c.answer()
+        return
+    
+    # Generate HTML using the selected template
+    try:
+        from html_templates import BUILDERS
+        builder = BUILDERS.get(template_type)
+        
+        if not builder:
+            await c.answer(f"Шаблон {template_type} не найден", show_alert=True)
+            return
+        
+        txt, html = builder(link_url)
+        
+        # Send HTML via email
+        ok = await send_html_email(user_id, to_email, f"HTML-Template {template_type}", html)
+        
+        # Create files for chat
+        txtf = types.BufferedInputFile(txt.encode("utf-8"), filename=f"{template_type.lower()}.txt")
+        htmlf = types.BufferedInputFile(html.encode("utf-8"), filename=f"{template_type.lower()}.html")
+        
+        # Send to chat
+        await c.message.edit_text(f"HTML шаблон {template_type} сгенерирован и отправлен!")
+        await bot.send_document(c.message.chat.id, txtf, caption=f"{template_type} (TXT)")
+        await bot.send_document(
+            c.message.chat.id, 
+            htmlf, 
+            caption=f"{template_type} (HTML) - {'✅ Отправлено' if ok else '❌ Ошибка отправки'} на {to_email}",
+            reply_to_message_id=src_tg_mid
+        )
+        
+        await c.answer()
+        
+    except Exception as e:
+        await c.answer(f"Ошибка генерации шаблона: {str(e)}", show_alert=True)
+
+@dp.message(CustomHTMLFSM.waiting_text)
+async def custom_html_text_received(m: types.Message, state: FSMContext):
+    if not await ensure_approved(m): return
+    
+    data = await state.get_data()
+    custom_text = (m.text or "").strip()
+    
+    if not custom_text:
+        await m.answer("Текст не может быть пустым. Попробуйте снова:")
+        return
+    
+    link_url = data["link_url"]
+    to_email = data["to_email"]
+    src_tg_mid = data["src_tg_mid"]
+    
+    # Generate custom HTML
+    try:
+        from html_templates import build_custom
+        txt, html = build_custom(link_url, custom_text)
+        
+        # Send HTML via email
+        ok = await send_html_email(m.from_user.id, to_email, "HTML-Template CUSTOM", html)
+        
+        # Create files for chat
+        txtf = types.BufferedInputFile(txt.encode("utf-8"), filename="custom.txt")
+        htmlf = types.BufferedInputFile(html.encode("utf-8"), filename="custom.html")
+        
+        # Send to chat
+        await m.answer("Кастомный HTML шаблон сгенерирован и отправлен!")
+        await m.answer_document(txtf, caption="CUSTOM (TXT)")
+        await m.answer_document(
+            htmlf, 
+            caption=f"CUSTOM (HTML) - {'✅ Отправлено' if ok else '❌ Ошибка отправки'} на {to_email}",
+            reply_to_message_id=src_tg_mid
+        )
+        
+        await state.clear()
+        
+    except Exception as e:
+        await m.answer(f"Ошибка генерации кастомного шаблона: {str(e)}")
+
+async def send_html_email(user_id: int, to_email: str, subject: str, html_body: str) -> bool:
+    """Send HTML email using the bot's email system"""
+    try:
+        # Get first available account for sending
+        with SessionLocal() as s:
+            acc = s.query(Account).filter_by(user_id=user_id, active=True).first()
+            if not acc:
+                return False
+            
+            return await send_email_via_account(
+                user_id, acc.id, to_email, subject, html_body, html=True
+            )
+    except Exception:
+        return False
+
 @dp.callback_query(F.data == "noop")
 async def noop_cb(c: types.CallbackQuery):
     await safe_cq_answer(c)
@@ -580,7 +965,8 @@ def settings_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="📗 Умные пресеты", callback_data="smart:open")],
         [InlineKeyboardButton(text="📧 E‑mail", callback_data="emails:open"),
          InlineKeyboardButton(text="🌐 Прокси", callback_data="proxies:root")],
-        [InlineKeyboardButton(text="⏱ Интервал", callback_data="interval:open")],
+        [InlineKeyboardButton(text="⏱ Интервал", callback_data="interval:open"),
+         InlineKeyboardButton(text="🔑 API Token", callback_data="settings:api_token")],
         [InlineKeyboardButton(text="♻️ Скрыть", callback_data="ui:hide")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -3174,10 +3560,19 @@ async def fetch_and_post_new_mails(user_id: int, acc: Account, chat_id: int) -> 
                 f"Тема:\n{code(m['subject'])}\n\n"
                 f"Текст:\n{code(m['body'])}"
             )
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="✉️ Ответить", callback_data="reply:msg")]]
-            )
+            kb = get_incoming_message_keyboard(user_id, 0)  # Will be updated after message is sent
             tg_msg = await bot.send_message(chat_id, text, reply_markup=kb)
+            
+            # Update keyboard with correct message_id
+            kb = get_incoming_message_keyboard(user_id, tg_msg.message_id)
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=chat_id, 
+                    message_id=tg_msg.message_id, 
+                    reply_markup=kb
+                )
+            except Exception:
+                pass
 
             # HTML-вложение как документ, ответом на лог входящего
             try:
@@ -3200,6 +3595,17 @@ async def fetch_and_post_new_mails(user_id: int, acc: Account, chat_id: int) -> 
                     tg_message_id=tg_msg.message_id
                 ))
                 s.commit()
+
+            # Store in runtime fallback for link creation
+            INCOMING_RT[(user_id, tg_msg.message_id)] = {
+                "account_id": acc.id,
+                "uid": m["uid"],
+                "from_name": m["from_name"],
+                "from_email": m["from_email"],
+                "subject": m["subject"],
+                "body": m["body"],
+                "tg_message_id": tg_msg.message_id
+            }
 
             try:
                 await bot.pin_chat_message(chat_id, tg_msg.message_id, disable_notification=True)
