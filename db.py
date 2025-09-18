@@ -173,6 +173,30 @@ def set_setting(user_id: int, key: str, value: str):
             st.value = value
         s.commit()
 
+# Async versions for bot handlers
+async def get_setting_async(user_id: int, key: str, default: Optional[str] = None) -> Optional[str]:
+    """Async version of get_setting for use in bot handlers"""
+    import asyncio
+    return await asyncio.to_thread(get_setting, user_id, key, default)
+
+async def set_setting_async(user_id: int, key: str, value: str):
+    """Async version of set_setting for use in bot handlers"""
+    import asyncio
+    return await asyncio.to_thread(set_setting, user_id, key, value)
+
+def get_incoming_message_by_tgmid(user_id: int, tg_message_id: int) -> Optional["IncomingMessage"]:
+    """Get incoming message by Telegram message ID"""
+    with SessionLocal() as s:
+        return s.query(IncomingMessage).filter_by(
+            user_id=user_id, 
+            tg_message_id=tg_message_id
+        ).first()
+
+async def get_incoming_message_by_tgmid_async(user_id: int, tg_message_id: int) -> Optional["IncomingMessage"]:
+    """Async version of get_incoming_message_by_tgmid for use in bot handlers"""
+    import asyncio
+    return await asyncio.to_thread(get_incoming_message_by_tgmid, user_id, tg_message_id)
+
 def list_domains(s: Session, user_id: int) -> list[str]:
     doms = s.query(Domain).filter_by(user_id=user_id).order_by(Domain.order_index.asc(), Domain.id.asc()).all()
     return [d.name for d in doms]
