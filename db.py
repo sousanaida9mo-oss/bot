@@ -240,4 +240,17 @@ def add_blacklist_base(s: Session, user_id: int, base: str):
     if base and not s.query(BlacklistBase).filter_by(user_id=user_id, base=base).first():
         s.add(BlacklistBase(user_id=user_id, base=base)); s.commit()
 
+def get_incoming_message_by_tgmid_async(user_id: int, tg_message_id: int) -> Optional["IncomingMessage"]:
+    """
+    Retrieve an incoming message by user_id and telegram message_id.
+    Returns None if not found.
+    """
+    with SessionLocal() as s:
+        return (
+            s.query(IncomingMessage)
+            .filter_by(user_id=user_id, tg_message_id=tg_message_id)
+            .order_by(IncomingMessage.id.desc())
+            .first()
+        )
+
 init_db()

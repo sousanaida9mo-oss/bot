@@ -42,6 +42,7 @@ from db import (
     list_domains, set_domains_order, add_domain, delete_domains_by_indices, clear_domains,
     add_account, update_account, delete_account, clear_accounts,
     get_setting, set_setting,
+    get_incoming_message_by_tgmid_async,
 )
 
 import config
@@ -229,6 +230,8 @@ SEND_STATUS: Dict[int, Dict[str, Any]] = {}
 START_LOG_SENT: Dict[Tuple[int, str], bool] = {}
 ERROR_LOG_SENT: Dict[Tuple[int, str], bool] = {}
 QUICK_ADD_FIRST_PASS: dict[tuple[int, int], bool] = {}
+# Runtime dict mapping (user_id, tg_message_id) -> incoming email context
+INCOMING_RT: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
 def mark_quick_add_first_pass(user_id: int, account_id: int) -> None:
     """
@@ -2540,6 +2543,31 @@ async def _mark_replied(chat_id: int, src_tg_mid: int):
     except Exception:
         pass
 
+async def _ensure_incoming_rt(uid: int, tg_mid: int) -> bool:
+    """
+    Ensure runtime context for incoming message exists in INCOMING_RT.
+    If missing (e.g., after bot restart), reconstruct from DB.
+    Returns True if context is available, False otherwise.
+    """
+    key = (uid, tg_mid)
+    if key in INCOMING_RT:
+        return True
+    
+    # Attempt to reconstruct from DB
+    row = get_incoming_message_by_tgmid_async(uid, tg_mid)
+    if not row:
+        return False
+    
+    # Populate runtime dict
+    INCOMING_RT[key] = {
+        "account_id": row.account_id,
+        "from_name": row.from_name or "",
+        "from_email": row.from_email or "",
+        "subject": row.subject or "",
+        "body": row.body or "",
+    }
+    return True
+
 
 @dp.callback_query(F.data == "reply:msg")
 async def reply_msg_cb(c: types.CallbackQuery, state: FSMContext):
@@ -2699,6 +2727,79 @@ async def reply_back(c: types.CallbackQuery, state: FSMContext):
 async def reply_cancel(c: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await safe_edit_message(c.message, "Отменено.", reply_markup=None); await safe_cq_answer(c)
+
+@dp.callback_query(F.data.startswith("adlink:create:"))
+async def adlink_create_cb(c: types.CallbackQuery):
+    """Handler for creating ad link from incoming email."""
+    if not await ensure_approved(c): return
+    
+    uid = c.from_user.id
+    # Parse origin_mid from callback data; if 0 or missing, use current message id
+    parts = c.data.split(":")
+    origin_mid = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+    if origin_mid == 0:
+        origin_mid = c.message.message_id
+    
+    # Ensure runtime context exists (reconstruct from DB if needed)
+    if not await _ensure_incoming_rt(uid, origin_mid):
+        await c.answer("Нет контекста", show_alert=True)
+        return
+    
+    ctx = INCOMING_RT[(uid, origin_mid)]
+    from_email = ctx.get("from_email", "")
+    subject = ctx.get("subject", "")
+    
+    # Create ad link (for demonstration, using a simple format)
+    # In production this might be a real URL or database entry
+    ad_link = f"https://example.com/ad/{uid}/{origin_mid}"
+    
+    # Store link in runtime context for later retrieval
+    ctx["ad_link"] = ad_link
+    
+    # Update keyboard to show "open link" button instead
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="✉️ Ответить", callback_data="reply:msg"),
+            InlineKeyboardButton(text="🔗 Открыть ссылку", callback_data=f"adlink:open:{origin_mid}")
+        ]]
+    )
+    
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=c.message.chat.id,
+            message_id=origin_mid,
+            reply_markup=kb
+        )
+    except Exception:
+        pass
+    
+    await c.answer(f"Ссылка создана: {ad_link}", show_alert=True)
+
+@dp.callback_query(F.data.startswith("adlink:open:"))
+async def adlink_open_cb(c: types.CallbackQuery):
+    """Handler for opening existing ad link."""
+    if not await ensure_approved(c): return
+    
+    uid = c.from_user.id
+    # Parse origin_mid from callback data; if 0 or missing, use current message id
+    parts = c.data.split(":")
+    origin_mid = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+    if origin_mid == 0:
+        origin_mid = c.message.message_id
+    
+    # Ensure runtime context exists (reconstruct from DB if needed)
+    if not await _ensure_incoming_rt(uid, origin_mid):
+        await c.answer("Нет контекста", show_alert=True)
+        return
+    
+    ctx = INCOMING_RT[(uid, origin_mid)]
+    ad_link = ctx.get("ad_link")
+    
+    if not ad_link:
+        await c.answer("Ссылка ещё не создана", show_alert=True)
+        return
+    
+    await c.answer(f"Ссылка: {ad_link}", show_alert=True)
 
 @dp.message(ReplyFSM.compose)
 async def reply_compose_text_or_photo(m: types.Message, state: FSMContext):
@@ -3174,8 +3275,12 @@ async def fetch_and_post_new_mails(user_id: int, acc: Account, chat_id: int) -> 
                 f"Тема:\n{code(m['subject'])}\n\n"
                 f"Текст:\n{code(m['body'])}"
             )
+            # Initial keyboard with placeholder for link button
             kb = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="✉️ Ответить", callback_data="reply:msg")]]
+                inline_keyboard=[[
+                    InlineKeyboardButton(text="✉️ Ответить", callback_data="reply:msg"),
+                    InlineKeyboardButton(text="🔗 Создать ссылку", callback_data="adlink:create:0")
+                ]]
             )
             tg_msg = await bot.send_message(chat_id, text, reply_markup=kb)
 
@@ -3200,6 +3305,27 @@ async def fetch_and_post_new_mails(user_id: int, acc: Account, chat_id: int) -> 
                     tg_message_id=tg_msg.message_id
                 ))
                 s.commit()
+
+            # Populate runtime context
+            INCOMING_RT[(user_id, tg_msg.message_id)] = {
+                "account_id": acc.id,
+                "from_name": m["from_name"],
+                "from_email": m["from_email"],
+                "subject": m["subject"],
+                "body": m["body"],
+            }
+
+            # Update keyboard with actual message id
+            try:
+                kb_updated = InlineKeyboardMarkup(
+                    inline_keyboard=[[
+                        InlineKeyboardButton(text="✉️ Ответить", callback_data="reply:msg"),
+                        InlineKeyboardButton(text="🔗 Создать ссылку", callback_data=f"adlink:create:{tg_msg.message_id}")
+                    ]]
+                )
+                await bot.edit_message_reply_markup(chat_id=chat_id, message_id=tg_msg.message_id, reply_markup=kb_updated)
+            except Exception:
+                pass
 
             try:
                 await bot.pin_chat_message(chat_id, tg_msg.message_id, disable_notification=True)
